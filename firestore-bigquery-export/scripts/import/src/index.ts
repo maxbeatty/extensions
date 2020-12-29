@@ -113,8 +113,9 @@ program
     "The path of the the Cloud Firestore Collection to import from. (This may, or may not, be the same Collection for which you plan to mirror changes.)"
   )
   .option(
-    "-q, --query-collection-group <query-collection-group>",
-    "A boolean value indicating whether you'd prefer a collection group query (true) or a collection query (false)"
+    "-q, --query-collection-group",
+    "Use a collection group query instead of a collection query",
+    false
   )
   .option(
     "-d, --dataset <dataset>",
@@ -132,7 +133,8 @@ program
   )
   .option(
     "-l, --dataset-location <location>",
-    "Location of the BigQuery dataset."
+    "Location of the BigQuery dataset.",
+    "us"
   );
 
 const questions = [
@@ -232,7 +234,7 @@ const run = async (): Promise<number> => {
     datasetLocation,
   }: CliConfig = await parseConfig();
 
-  const batch = parseInt(batchSize);
+  const batch = parseInt(batchSize, 10);
   const rawChangeLogName = `${tableId}_raw_changelog`;
   // Initialize Firebase
   firebase.initializeApp({
@@ -246,8 +248,8 @@ const run = async (): Promise<number> => {
   // We pass in the application-level "tableId" here. The tracker determines
   // the name of the raw changelog from this field.
   const dataSink = new FirestoreBigQueryEventHistoryTracker({
-    tableId: tableId,
-    datasetId: datasetId,
+    tableId,
+    datasetId,
     datasetLocation,
   });
 
@@ -257,19 +259,30 @@ const run = async (): Promise<number> => {
     }: ${sourceCollectionPath}, to BigQuery Dataset: ${datasetId}, Table: ${rawChangeLogName}`
   );
 
+  /**
+   *
+   * get all documents for each wildcard...
+   *
+   * for each groupId
+   *    for each userId
+   *        use existing cursor for collection picks
+   */
+  const subcollections = parseSourceCollectionPath(sourceCollectionPath);
+  console.debug("subcollections", subcollections);
+  const firestore = firebase.firestore();
+
   // Build the data row with a 0 timestamp. This ensures that all other
   // operations supersede imports when listing the live documents.
-  let cursor;
+  let cursor: FirebaseFirestore.DocumentSnapshot;
 
   let cursorPositionFile =
     __dirname +
-    `/from-${sourceCollectionPath}-to-${projectId}_${datasetId}_${rawChangeLogName}`;
+    `/from-${
+      sourceCollectionPath[sourceCollectionPath.length - 1]
+    }-to-${projectId}_${datasetId}_${rawChangeLogName}`;
   if (await exists(cursorPositionFile)) {
     let cursorDocumentId = (await read(cursorPositionFile)).toString();
-    cursor = await firebase
-      .firestore()
-      .doc(cursorDocumentId)
-      .get();
+    cursor = await firestore.doc(cursorDocumentId).get();
     console.log(
       `Resuming import of Cloud Firestore Collection ${sourceCollectionPath} ${
         queryCollectionGroup ? " (via a Collection Group query)" : ""
@@ -287,9 +300,9 @@ const run = async (): Promise<number> => {
     let query: firebase.firestore.Query;
 
     if (queryCollectionGroup) {
-      query = firebase.firestore().collectionGroup(sourceCollectionPath);
+      query = firestore.collectionGroup(sourceCollectionPath);
     } else {
-      query = firebase.firestore().collection(sourceCollectionPath);
+      query = firestore.collection(sourceCollectionPath);
     }
 
     query = query.limit(batch);
@@ -338,11 +351,9 @@ async function parseConfig(): Promise<CliConfig> {
       program.sourceCollectionPath === undefined ||
       program.dataset === undefined ||
       program.tableNamePrefix === undefined ||
-      program.queryCollectionGroup === undefined ||
-      program.batchSize === undefined ||
-      program.datasetLocation === undefined ||
       !validateBatchSize(program.batchSize)
     ) {
+      console.error("Error: missing options with no default.");
       program.outputHelp();
       process.exit(1);
     }
@@ -352,7 +363,7 @@ async function parseConfig(): Promise<CliConfig> {
       datasetId: program.dataset,
       tableId: program.tableNamePrefix,
       batchSize: program.batchSize,
-      queryCollectionGroup: program.queryCollectionGroup === "true",
+      queryCollectionGroup: program.queryCollectionGroup,
       datasetLocation: program.datasetLocation,
     };
   }
@@ -374,6 +385,28 @@ async function parseConfig(): Promise<CliConfig> {
     queryCollectionGroup: queryCollectionGroup,
     datasetLocation: datasetLocation,
   };
+}
+
+function parseSourceCollectionPath(sourceCollectionPath: string): string[] {
+  let collections = [];
+
+  sourceCollectionPath.split("/").forEach((part) => {
+    if (part.startsWith("{") && part.endsWith("}")) {
+      /* wildcard */
+    } else {
+      collections.push(part);
+    }
+  });
+
+  return collections;
+}
+
+const reBeginWildcard = /\/{/g;
+const reEndWildcard = /}\//g;
+function kebabSourceCollectionPath(sourceCollectionPath: string): string {
+  return sourceCollectionPath
+    .replace(reBeginWildcard, "-")
+    .replace(reEndWildcard, "-");
 }
 
 run()
